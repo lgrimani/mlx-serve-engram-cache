@@ -1,0 +1,10 @@
+/.venv/
+/mlx-serve/
+/engram-pack/
+__pycache__/
+.DS_Store
+.env
+*.safetensors
+*.bitmap
+*.bin
+*.zst
