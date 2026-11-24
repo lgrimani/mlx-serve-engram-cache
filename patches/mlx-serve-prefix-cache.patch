@@ -1,0 +1,547 @@
+diff --git a/src/engines/mlx/cache/prefix_cache.zig b/src/engines/mlx/cache/prefix_cache.zig
+index d3319fa..2b02e7d 100644
+--- a/src/engines/mlx/cache/prefix_cache.zig
++++ b/src/engines/mlx/cache/prefix_cache.zig
+@@ -228,7 +228,7 @@ const ModulePayload = struct {
+     tail_from: usize = 0,
+ };
+ 
+-const ModuleRequest = struct { binding: ModuleBinding, media_rows: ?Array, cuts: bool = true };
++const ModuleRequest = struct { binding: ModuleBinding, media_rows: ?Array, cuts: bool = true, diagnose: bool = false };
+ 
+ /// Bounded caller storage; only the selected part transfers references into the tier.
+ const ModuleExport = struct {
+@@ -328,6 +328,7 @@ fn moduleDtype(dtype: mlx.mlx_dtype) ![]const u8 {
+ }
+ 
+ const Entry = struct {
++    restored_for_extension: bool = false,
+     /// `prompt_ids ++ generated_ids` from the request that produced this snapshot.
+     /// Owned by the entry; freed on eviction.
+     tokens: []u32,
+@@ -645,7 +646,12 @@ pub const EvictionReport = struct {
+     admitted: bool = false,
+ };
+ 
++const history_diag = @import("prompt_history.zig");
+ pub const HotPrefixCache = struct {
++    trace_prompts: bool = false,
++    prefer_recent_parent: bool = false,
++    history: history_diag.History = .{},
++
+     entries: std.ArrayList(Entry),
+     max_entries: u32,
+     /// An entry untouched this long is evicted before the workload-fair rule applies.
+@@ -732,6 +738,32 @@ pub const HotPrefixCache = struct {
+     /// Byte floor for `restoreWouldPinEntry`; a field so a test can reproduce the live shape.
+     restore_pin_min_bytes: u64 = RESTORE_PIN_MIN_BYTES,
+ 
++    fn traceReject(self: *const HotPrefixCache, entry: *const Entry, reason: []const u8, shared: ?usize) void {
++        log.info("[prefix-diag] reject request={d} entry={d} boundary={d} rule={s} shared_with_media={?d}\n", .{ self.history.serial + 1, entry.id, entry.tokens.len, reason, shared });
++    }
++
++    pub fn tracePrompt(self: *HotPrefixCache, ids: []const u32, media: []const MediaSpan, tools: bool, variant: u64, restored: usize, skipped: bool) void {
++        if (!self.trace_prompts) return;
++        const seq = self.history.serial + 1;
++        if (restored == 0) for (self.history.rows) |r| {
++            if (r.seq == 0) continue;
++            const raw = history_diag.common(r.ids, ids);
++            const media_bound = mediaSharedBound(r.media, media);
++            log.info("[prefix-diag] miss request={d} previous={d} previous_tokens={d} shared_ids={d} shared_with_media={d} tools_match={}\n", .{ seq, r.seq, r.ids.len, raw, @min(raw, media_bound), r.tools == tools });
++            for ([_]?history_diag.Lost{ r.boundary, r.tail }, 0..) |maybe_lost, kind| {
++                const lost = maybe_lost orelse continue;
++                var shared = @min(raw, lost.n);
++                if (kind == 1 and raw == r.ids.len) shared += history_diag.common(r.suffix, ids[raw..]);
++                const compatible = shared == lost.n and lost.n < ids.len and media_bound >= lost.n and tools == r.tools and lost.variant == variant;
++                log.info("[prefix-diag] evicted_compare request={d} previous={d} entry={d} boundary={d} shared_ids={d} shared_with_media={d} whole_prefix_compatible={}\n", .{ seq, r.seq, lost.id, lost.n, shared, @min(shared, media_bound), compatible });
++            }
++        };
++        self.history.add(self.allocator, ids, media, tools) catch {
++            log.warn("[prefix-diag] history allocation failed request={d}\n", .{seq});
++        };
++        log.info("[prefix-diag] request={d} tokens={d} media_items={d} restored={d} bypass={} resident_entries={d} history_capacity={d}\n", .{ seq, ids.len, media.len, restored, skipped, self.entries.items.len, self.history.rows.len });
++    }
++
+     pub fn init(allocator: std.mem.Allocator, max_entries: u32) HotPrefixCache {
+         return initWithMem(allocator, max_entries, 0);
+     }
+@@ -741,6 +773,8 @@ pub const HotPrefixCache = struct {
+             .entries = std.ArrayList(Entry).empty,
+             .max_entries = max_entries,
+             .ram_enabled = max_entries > 0,
++            .prefer_recent_parent = if (std.c.getenv("MLX_SERVE_PREFIX_PREFER_PARENT")) |v| std.mem.eql(u8, std.mem.span(v), "1") else false,
++            .trace_prompts = if (std.c.getenv("MLX_SERVE_PREFIX_DIAG")) |v| std.mem.eql(u8, std.mem.span(v), "1") else false,
+             .max_kv_bytes = max_kv_bytes,
+             .current_kv_bytes = 0,
+             .allocator = allocator,
+@@ -760,6 +794,7 @@ pub const HotPrefixCache = struct {
+     }
+ 
+     pub fn deinit(self: *HotPrefixCache) void {
++        self.history.deinit(self.allocator);
+         if (self.disk) |*d| d.pollModuleWrites();
+         self.cancelModuleExports(.unload);
+         for (self.entries.items) |*e| {
+@@ -1330,10 +1365,20 @@ pub const HotPrefixCache = struct {
+         var best_effective: usize = 0;
+         var best_cut: usize = 0;
+         for (self.entries.items, 0..) |*e, i| {
++            const trace = if (module_request) |req| req.diagnose else false;
+             // A checked-out entry's buffers belong to another slot; its snapshot is empty.
+-            if (e.checked_out_by != null) continue;
+-            if (e.has_tools != has_tools) continue;
+-            if (!std.meta.eql(e.quant_config, quant_config)) continue;
++            if (e.checked_out_by != null) {
++                if (trace) self.traceReject(e, "checked_out", null);
++                continue;
++            }
++            if (e.has_tools != has_tools) {
++                if (trace) self.traceReject(e, "tool_mode", null);
++                continue;
++            }
++            if (!std.meta.eql(e.quant_config, quant_config)) {
++                if (trace) self.traceReject(e, "quantization", null);
++                continue;
++            }
+ 
+             const max_shared = @min(e.tokens.len, prompt_ids.len, mediaSharedBound(e.media, media));
+             var shared: usize = 0;
+@@ -1349,20 +1394,33 @@ pub const HotPrefixCache = struct {
+ 
+             if (e.module) |m| {
+                 const request = module_request orelse continue;
+-                if (!ModuleBinding.same(m.binding, request.binding) or m.n == 0) continue;
++                if (!ModuleBinding.same(m.binding, request.binding) or m.n == 0) {
++                    if (trace) self.traceReject(e, "module_binding", null);
++                    continue;
++                }
+                 // An entry that ends inside the prompt restores whole. One that outruns the prompt or leaves it is
+                 // worth what the plugin can cut it to, text only: its key covers image rows a cut cannot re-derive.
+                 const whole = shared == m.n and m.n < prompt_ids.len;
+                 const cut = if (whole or !request.cuts or e.media.len > 0 or spansBelow(media, shared).len > 0) 0 else @min(shared, prompt_ids.len -| 1);
+                 const worth = if (whole) m.n else cut -| MODULE_CUT_COST;
+-                if (worth <= best_effective) continue;
++                if (worth <= best_effective) {
++                    if (trace) {
++                        const why: []const u8 = if (whole or worth > 0) "better_candidate" else if (e.media.len > 0 or spansBelow(media, shared).len > 0) "multimodal_requires_whole" else if (!request.cuts) "whole_only_fallback" else "short_prefix";
++                        self.traceReject(e, why, shared);
++                    }
++                    continue;
++                }
+                 var key: u64 = 0;
+                 const had_error = mlx.errorPending();
+                 if (!plugin_driver.auxPrefixKey(request.binding.xfm, e.tokens, request.media_rows, &key).isOk()) {
++                    if (trace) self.traceReject(e, "plugin_key_unavailable", shared);
+                     mlx.dropLatchedErrorUnless(had_error);
+                     continue;
+                 }
+-                if (variantKey(key, request.binding.variant) != m.prefix_key) continue;
++                if (variantKey(key, request.binding.variant) != m.prefix_key) {
++                    if (trace) self.traceReject(e, "plugin_prefix_key", shared);
++                    continue;
++                }
+                 best_effective = worth;
+                 best_shared = if (whole) m.n else cut;
+                 best_cut = cut;
+@@ -1416,6 +1474,10 @@ pub const HotPrefixCache = struct {
+         return self.moduleMatch(.{ .binding = binding, .media_rows = media_rows, .cuts = false }, prompt_ids, has_tools, media, quant_config);
+     }
+ 
++    pub fn lookupPrompt(self: *HotPrefixCache, binding: ModuleBinding, ids: []const u32, tools: bool, media: []const MediaSpan, rows: ?Array, quant: kv_quant.KVQuantConfig, cuts: bool) ?ModuleMatch {
++        return self.moduleMatch(.{ .binding = binding, .media_rows = rows, .cuts = cuts, .diagnose = self.trace_prompts }, ids, tools, media, quant);
++    }
++
+     fn moduleMatch(self: *HotPrefixCache, request: ModuleRequest, prompt_ids: []const u32, has_tools: bool, media: []const MediaSpan, quant_config: kv_quant.KVQuantConfig) ?ModuleMatch {
+         const binding = request.binding;
+         const media_rows = request.media_rows;
+@@ -1459,6 +1521,7 @@ pub const HotPrefixCache = struct {
+                 self.evictAt(i, "module restore failed");
+                 return 0;
+             }
++            e.restored_for_extension = self.prefer_recent_parent and e.media.len > 0 and payload.tail_from == 0;
+             e.last_used = self.bumpCounter();
+             e.touched_ms = crt.monotonicMs();
+             // Evicting the entry this request runs on frees nothing while the slot shares it.
+@@ -1505,6 +1568,13 @@ pub const HotPrefixCache = struct {
+     /// Tokens a RAM restore would cover for a text prompt, read without touching any state. A
+     /// pre-filter only: the SSD tier, a lien, a QSA gap or a checkout taken since can still change
+     /// what the real lookup restores.
++    /// RAM-only text estimate. A module restore (including its exact cut) is validated again at admission.
++    pub fn peekModuleTextTokens(self: *HotPrefixCache, binding: ModuleBinding, ids: []const u32, tools: bool, quant: kv_quant.KVQuantConfig) usize {
++        if (!self.ram_enabled or self.max_entries == 0) return 0;
++        const match = self.findBestRestorableMatchWithModule(ids, tools, &.{}, quant, false, null, .{ .binding = binding, .media_rows = null }) orelse return 0;
++        return match.shared;
++    }
++
+     pub fn peekMatchedTokens(self: *const HotPrefixCache, prompt_ids: []const u32, has_tools: bool, quant_config: kv_quant.KVQuantConfig, require_ssm_checkpoint: bool) usize {
+         const m = self.findBestRestorableMatch(prompt_ids, has_tools, &.{}, quant_config, require_ssm_checkpoint, null) orelse return 0;
+         if (!require_ssm_checkpoint) return m.shared;
+@@ -2080,7 +2150,10 @@ pub const HotPrefixCache = struct {
+             self.incoming_tip = .{ .binding = binding, .ids = ids, .media = eff_media, .has_tools = has_tools, .quant_config = quant_config };
+             defer self.incoming_tip = null;
+             // An over-budget state takes the whole budget: everything else goes first, so only it overshoots.
+-            break :blk self.makeModuleRoom(if (over) self.max_kv_bytes else aux_bytes, cache_key, tail_from > 0);
++            const parent = if (self.prefer_recent_parent and tail_from == 0 and !over and eff_media.len > 0)
++                self.consumeRestoredParent(binding, ids, eff_media, has_tools, quant_config, cache_key)
++            else null;
++            break :blk self.makeModuleRoom(if (over) self.max_kv_bytes else aux_bytes, cache_key, tail_from > 0, parent);
+         };
+         if (!room) {
+             self.logModuleDecline(ids.len, aux_bytes, if (tail_from > 0) "a decode-end checkpoint takes no prompt boundary's room" else "no entry could be evicted for it");
+@@ -2265,9 +2338,44 @@ pub const HotPrefixCache = struct {
+         return best;
+     }
+ 
++    // Consume a restore once, on the next extending prompt commit of the same workload.
++    fn consumeRestoredParent(self: *HotPrefixCache, binding: ModuleBinding, ids: []const u32, media: []const MediaSpan, tools: bool, quant: kv_quant.KVQuantConfig, key: u64) ?u64 {
++        var parent: ?u64 = null;
++        var newest: u64 = 0;
++        for (self.entries.items) |*e| {
++            if (!e.restored_for_extension or e.cache_key != key or e.tokens.len >= ids.len) continue;
++            if (!moduleRungOf(e, binding, ids, media, tools, quant)) continue;
++            e.restored_for_extension = false;
++            if (e.last_used > newest) {
++                newest = e.last_used;
++                parent = e.id;
++            }
++        }
++        return parent;
++    }
++
++    fn byteBudgetVictim(self: *HotPrefixCache, key: u64, parent: ?u64) ?usize {
++        var rule: []const u8 = "workload_fair_lru";
++        var victim = self.selectLru(null, key, &rule) orelse return null;
++        const original = &self.entries.items[victim];
++        if (parent == original.id and std.mem.eql(u8, rule, "older_branch_checkpoint")) {
++            // Spend only this workload's older state. The parent remains eligible if it must go.
++            var oldest = original.last_used;
++            for (self.entries.items, 0..) |*e, i| {
++                if (e.checked_out_by != null or e.cache_key != key or e.module == null or e.last_used >= oldest) continue;
++                if (!ModuleBinding.same(e.module.?.binding, original.module.?.binding)) continue;
++                oldest = e.last_used;
++                victim = i;
++                rule = "same_workload_older_checkpoint";
++            }
++        }
++        if (self.trace_prompts) log.info("[prefix-diag] victim entry={d} rule={s}\n", .{ self.entries.items[victim].id, rule });
++        return victim;
++    }
++
+     /// Decode-end entries (`tail`) fill what the budget has spare: any commit takes the least recently used of them
+     /// first, and one of them takes nothing else, so no conversation loses its prompt boundary to another's tail.
+-    fn makeModuleRoom(self: *HotPrefixCache, bytes: u64, cache_key: u64, tail: bool) bool {
++    fn makeModuleRoom(self: *HotPrefixCache, bytes: u64, cache_key: u64, tail: bool, parent: ?u64) bool {
+         while (!self.moduleFits(bytes)) {
+             const i = self.lruTail() orelse break;
+             self.evictAt(i, "decode-end checkpoint, for room");
+@@ -2279,7 +2387,7 @@ pub const HotPrefixCache = struct {
+         if (self.max_kv_bytes == 0) return true;
+         if (self.residentBytes() > self.max_kv_bytes - bytes) self.cancelPendingModules(.memory_pressure);
+         while (self.residentBytes() > self.max_kv_bytes - bytes) {
+-            const idx = self.lruIndexExcluding(null, cache_key) orelse return false;
++            const idx = self.byteBudgetVictim(cache_key, parent) orelse return false;
+             self.evictAtWithCancellation(idx, "byte budget", .memory_pressure);
+         }
+         return true;
+@@ -3818,7 +3926,7 @@ pub const HotPrefixCache = struct {
+     }
+ 
+     fn evictOneLru(self: *HotPrefixCache, reason: []const u8, incoming_key: ?u64) void {
+-        const idx = self.lruIndexExcluding(null, incoming_key) orelse return;
++        const idx = self.moduleVictim(incoming_key) orelse return;
+         self.evictAt(idx, reason);
+     }
+ 
+@@ -3860,6 +3968,10 @@ pub const HotPrefixCache = struct {
+ 
+     fn evictAtWithCancellation(self: *HotPrefixCache, lru_idx: usize, reason: []const u8, cancellation: ?kv_disk_cache.DiskTier.ModuleCancellation) void {
+         var evicted = self.entries.swapRemove(lru_idx);
++        if (self.trace_prompts) if (evicted.module) |m| {
++            const tracked = self.history.rememberEviction(self.allocator, evicted.tokens, evicted.media, evicted.has_tools, m.tail_from, .{ .n = m.n, .id = evicted.id, .variant = m.binding.variant });
++            log.info("[prefix-diag] eviction entry={d} tokens={d} trigger={s} retained_for_comparison={}\n", .{ evicted.id, m.n, reason, tracked });
++        };
+         const tokens_len = evicted.tokens.len;
+         const kv_mb = @as(f64, @floatFromInt(evicted.kv_bytes)) / (1024.0 * 1024.0);
+         const had_ssm = evicted.ssm_checkpoints != null;
+@@ -3877,7 +3989,7 @@ pub const HotPrefixCache = struct {
+         self.evicted_billed_bytes +|= billed;
+         self.evicted_live_bytes +|= freed_live;
+         log.debug("  [hot-cache] eviction ({s}) returned {d} MB live of {d} MB billed, {d} MB parked for the SSD tier; since load {d} of {d} MB\n", .{
+-            reason,                                  freed_live >> 20,                 billed >> 20,
++            reason,                                      freed_live >> 20,              billed >> 20,
+             (self.parkedBytes() -| parked_before) >> 20, self.evicted_live_bytes >> 20, self.evicted_billed_bytes >> 20,
+         });
+         if (had_ssm) {
+@@ -4136,7 +4248,18 @@ pub const HotPrefixCache = struct {
+     /// (`incoming_key` counts as one more) are candidates, so a sweep evicts its own
+     /// documents before another workload's conversation. One key = plain LRU. An entry idle past
+     /// `stale_after_ms` goes first: a finished session's lone entry must not shield itself forever.
++    fn moduleVictim(self: *const HotPrefixCache, incoming_key: ?u64) ?usize {
++        var rule: []const u8 = "workload_fair_lru";
++        const i = self.selectLru(null, incoming_key, &rule) orelse return null;
++        if (self.trace_prompts) log.info("[prefix-diag] victim entry={d} rule={s}\n", .{ self.entries.items[i].id, rule });
++        return i;
++    }
++
+     fn lruIndexExcluding(self: *const HotPrefixCache, protect: ?u64, incoming_key: ?u64) ?usize {
++        return self.selectLru(protect, incoming_key, null);
++    }
++
++    fn selectLru(self: *const HotPrefixCache, protect: ?u64, incoming_key: ?u64, rule: ?*[]const u8) ?usize {
+         var best: ?usize = null;
+         var best_used: u64 = std.math.maxInt(u64);
+         var max_count: usize = 0;
+@@ -4150,7 +4273,10 @@ pub const HotPrefixCache = struct {
+                     best = i;
+                 }
+             }
+-            if (best != null) return best;
++            if (best != null) {
++                if (rule) |r| r.* = "stale_lru";
++                return best;
++            }
+         }
+         // A rung goes before any conversation's tip, so every live conversation keeps its newest
+         // checkpoint while rungs remain.
+@@ -4163,7 +4289,10 @@ pub const HotPrefixCache = struct {
+                 best = i;
+             }
+         }
+-        if (best != null) return best;
++        if (best != null) {
++            if (rule) |r| r.* = "older_branch_checkpoint";
++            return best;
++        }
+         for (self.entries.items, 0..) |*e, i| {
+             // Held by a live slot that owns its buffers: evicting it frees nothing.
+             if (e.checked_out_by != null) continue;
+@@ -12195,7 +12324,6 @@ test "HotPrefixCache module: loaded instance gate keeps pipeline and streamed pa
+     cfg.dist_shard = null;
+ }
+ 
+-
+ test "HotPrefixCache module: incoming workload pays for eviction before an older conversation" {
+     var fake: ModuleFake = .{};
+     var bound: plugin_driver.Bound = undefined;
+@@ -13040,3 +13168,45 @@ test "HotPrefixCache: a whole-prompt plugin's checkpoint, stored through CacheOp
+     }
+     try testing.expectEqualStrings("", try pcSsmDiffField(s, &restored[0], &restored[1]));
+ }
++
++test "module byte budget preserves just restored multimodal parent over older same-key branch" {
++    for ([_]bool{ false, true }) |enabled| {
++        var fake: ModuleFake = .{};
++        var bound: plugin_driver.Bound = undefined;
++        var xfm: transformer_mod.Transformer = undefined;
++        const binding = fake.bind(&bound, &xfm);
++        var cache = HotPrefixCache.initWithMem(testing.allocator, 8, 80);
++        defer cache.deinit();
++        cache.prefer_recent_parent = enabled;
++        const media = &[_]MediaSpan{.{ .start = 0, .key = 1 }};
++        var old: ModuleFake.Snap = .{ .owner = &fake, .ids = &.{ 1, 9 }, .key = 10 };
++        var base: ModuleFake.Snap = .{ .owner = &fake, .ids = &.{ 1, 2 }, .key = 3 };
++        var review: ModuleFake.Snap = .{ .owner = &fake, .ids = &.{ 1, 2, 3 }, .key = 6 };
++        _ = try old.put(&cache, binding, media);
++        _ = try base.put(&cache, binding, media);
++        try testing.expectEqual(@as(usize, 2), cache.restoreModule(binding, cache.entries.items[1].id, 0));
++        _ = try review.put(&cache, binding, media);
++        try testing.expectEqual(@as(usize, @intFromBool(enabled)), old.frees);
++        try testing.expectEqual(@as(usize, @intFromBool(!enabled)), base.frees);
++        try testing.expectEqual(@as(u64, 80), cache.current_kv_bytes);
++    }
++}
++
++test "DeepSeek boundary estimate counts a resident module prefix on both sides of the cutoff" {
++    var fake: ModuleFake = .{};
++    var bound: plugin_driver.Bound = undefined;
++    var xfm: transformer_mod.Transformer = undefined;
++    const binding = fake.bind(&bound, &xfm);
++    var cache = HotPrefixCache.init(testing.allocator, 4);
++    defer cache.deinit();
++    const ids: [4097]u32 = @splat(1);
++    var snap: ModuleFake.Snap = .{ .owner = &fake, .ids = ids[0..3072], .key = 3072 };
++    _ = try snap.put(&cache, binding, &.{});
++    for ([_]usize{56, 1024, 1025}) |tail| {
++        const prompt = ids[0 .. 3072 + tail];
++        const n = cache.peekModuleTextTokens(binding, prompt, false, kv_quant.KVQuantConfig.dense);
++        try testing.expectEqual(tail, prompt.len - n);
++    }
++    try testing.expectEqual(@as(usize, 0), cache.peekModuleTextTokens(binding, &ids, true, kv_quant.KVQuantConfig.dense));
++    try testing.expectEqual(@as(usize, 0), fake.restores);
++}
+diff --git a/src/engines/mlx/cache/prompt_history.zig b/src/engines/mlx/cache/prompt_history.zig
+new file mode 100644
+index 0000000..dd146dd
+--- /dev/null
++++ b/src/engines/mlx/cache/prompt_history.zig
+@@ -0,0 +1,86 @@
++const std = @import("std");
++
++test "one hundred prompts rotate and deallocate; media and divergent ids stop matches" {
++    const a = std.testing.allocator;
++    var h: History = .{};
++    defer h.deinit(a);
++    for (0..101) |i| try h.add(a, &.{ @intCast(i), 7 }, &.{.{ .start = 1, .key = 10 }}, true);
++    try std.testing.expectEqual(@as(u64, 101), h.serial);
++    try std.testing.expectEqual(@as(u32, 100), h.rows[0].ids[0]);
++    try std.testing.expectEqual(@as(u32, 1), h.rows[1].ids[0]);
++    try std.testing.expectEqual(@as(usize, 1), common(h.rows[0].ids, &.{ 100, 8 }));
++    try std.testing.expectEqual(@as(usize, 1), mediaSharedBound(h.rows[0].media, &.{.{ .start = 1, .key = 11 }}));
++}
++
++const spans = @import("../../../sdk/kv/media_span.zig");
++pub const mediaSharedBound = spans.mediaSharedBound;
++pub fn common(a: []const u32, b: []const u32) usize {
++    return std.mem.findDiff(u32, a, b) orelse @min(a.len, b.len);
++}
++
++pub const Lost = struct { id: u64, n: usize, variant: u64 };
++const Row = struct {
++    seq: u64 = 0,
++    ids: []const u32 = &.{},
++    media: []const spans.MediaSpan = &.{},
++    tools: bool = false,
++    boundary: ?Lost = null,
++    tail: ?Lost = null,
++    suffix: []const u32 = &.{},
++
++    fn clear(r: *Row, a: std.mem.Allocator) void {
++        a.free(r.ids);
++        a.free(r.media);
++        a.free(r.suffix);
++        r.* = .{};
++    }
++};
++pub const History = struct {
++    rows: [100]Row = @splat(.{}),
++    serial: u64 = 0,
++
++    pub fn deinit(h: *History, a: std.mem.Allocator) void {
++        for (&h.rows) |*r| r.clear(a);
++    }
++    pub fn add(h: *History, a: std.mem.Allocator, ids: []const u32, media: []const spans.MediaSpan, tools: bool) !void {
++        const row = &h.rows[h.serial % h.rows.len];
++        row.clear(a);
++        h.serial += 1;
++        const owned = try a.dupe(u32, ids);
++        errdefer a.free(owned);
++        row.* = .{ .seq = h.serial, .ids = owned, .media = try a.dupe(spans.MediaSpan, media), .tools = tools };
++    }
++    pub fn rememberEviction(h: *History, a: std.mem.Allocator, ids: []const u32, media: []const spans.MediaSpan, tools: bool, tail_from: usize, lost: Lost) bool {
++        const n = if (tail_from > 0) tail_from else ids.len;
++        if (n > ids.len) return false;
++        for (0..@min(h.serial, h.rows.len)) |age| {
++            const r = &h.rows[(h.serial - 1 - age) % h.rows.len];
++            if (r.seq == 0 or r.tools != tools or (if (tail_from > 0) r.ids.len != n else (r.ids.len != n and r.ids.len != n + 1))) continue;
++            if (mediaSharedBound(r.media, media) < n or !std.mem.eql(u32, ids[0..n], r.ids[0..n])) continue;
++            if (tail_from == 0) {
++                r.boundary = lost;
++            } else {
++                const suffix = a.dupe(u32, ids[n..]) catch return false;
++                a.free(r.suffix);
++                r.suffix = suffix;
++                r.tail = lost;
++            }
++            return true;
++        }
++        return false;
++    }
++};
++
++test "evicted boundaries compare only their actual prefix; tails preserve generated ids" {
++    const a = std.testing.allocator;
++    var h: History = .{};
++    defer h.deinit(a);
++    try h.add(a, &.{ 1, 2, 3 }, &.{}, true);
++    const b: Lost = .{ .id = 7, .n = 2, .variant = 0 };
++    try std.testing.expect(!h.rememberEviction(a, &.{ 9, 2 }, &.{}, true, 0, b));
++    try std.testing.expect(h.rememberEviction(a, &.{ 1, 2 }, &.{}, true, 0, b));
++    var t = b;
++    t.n = 5;
++    try std.testing.expect(h.rememberEviction(a, &.{ 1, 2, 3, 8, 9 }, &.{}, true, 3, t));
++    try std.testing.expectEqualSlices(u32, &.{ 8, 9 }, h.rows[0].suffix);
++}
+diff --git a/src/engines/mlx/prefill.zig b/src/engines/mlx/prefill.zig
+index 6923859..c6bfb38 100644
+--- a/src/engines/mlx/prefill.zig
++++ b/src/engines/mlx/prefill.zig
+@@ -61,6 +61,7 @@ fn restoreModulePrompt(sch: *Scheduler, slot: *Slot, binding: prefix_cache_mod.M
+     var selected = modulePromptMatch(slot, binding, true);
+     var n = if (selected) |match| restoreModuleMatch(sch, slot, binding, match, id) else 0;
+     // The plugin holds no such cut: what an entry restores whole.
++    if (n == 0 and selected != null and slot.prefix_cache.?.trace_prompts) log.info("[prefix-diag] restore_failed request={d} entry={d} cut={d}\n", .{ slot.prefix_cache.?.history.serial + 1, selected.?.entry_id, selected.?.cut });
+     if (n == 0) if (selected) |match| if (match.cut > 0) {
+         selected = modulePromptMatch(slot, binding, false);
+         n = if (selected) |whole| restoreModuleMatch(sch, slot, binding, whole, id) else 0;
+@@ -78,6 +79,7 @@ fn restoreModulePrompt(sch: *Scheduler, slot: *Slot, binding: prefix_cache_mod.M
+     if (n > 0) if (selected) |match| {
+         log.info("[hot-cache] module restored source={s} id={d} position={d}{s}\n", .{ @tagName(match.source), if (match.source == .ram) match.entry_id else match.disk_id, n, if (match.cut > 0) " (cut from a longer entry)" else "" });
+     };
++    if (slot.prefix_cache) |hc| hc.tracePrompt(slot.full_prompt, slot.media, slot.has_tools, binding.variant, n, slot.skip_prefix_cache);
+     return n;
+ }
+ 
+@@ -85,8 +87,7 @@ fn modulePromptMatch(slot: *Slot, binding: prefix_cache_mod.ModuleBinding, cuts:
+     if (slot.skip_prefix_cache) return null;
+     const hc = slot.prefix_cache orelse return null;
+     if (!hc.ram_enabled or hc.max_entries == 0) return null;
+-    if (!cuts) return hc.findWholeModuleMatch(binding, slot.full_prompt, slot.has_tools, slot.media, slot.vision_embeddings, slot.cache.config);
+-    return hc.findModuleMatch(binding, slot.full_prompt, slot.has_tools, slot.media, slot.vision_embeddings, slot.cache.config);
++    return hc.lookupPrompt(binding, slot.full_prompt, slot.has_tools, slot.media, slot.vision_embeddings, slot.cache.config, cuts);
+ }
+ 
+ fn restoreModuleMatch(sch: *Scheduler, slot: *Slot, binding: prefix_cache_mod.ModuleBinding, match: prefix_cache_mod.ModuleMatch, id: u32) usize {
+diff --git a/src/engines/mlx/prefill_interleave.zig b/src/engines/mlx/prefill_interleave.zig
+index 6c5c313..43b634a 100644
+--- a/src/engines/mlx/prefill_interleave.zig
++++ b/src/engines/mlx/prefill_interleave.zig
+@@ -344,6 +344,10 @@ fn admitSmallAtBoundary(ic: *InterleaveCtx, share: f32, budget: *BoundaryBudget,
+         sch.boundary_outer = null;
+         sch.boundary_depth -= 1;
+         slot.boundary_max_tail = null;
++        if (outcome == .tail_too_large and slot.module_tail_hint != null) {
++            // A cut can restore fewer tokens than its estimate. Avoid retrying it on every chunk.
++            if (slot.prefix_cache) |hc| slot.module_tail_hint = .{ .counter = hc.counter, .entries = hc.entryCount(), .tail = slot.full_prompt.len };
++        }
+         const wait = outcome == .held or outcome == .tail_too_large;
+         // Back to the head of `pending` before `in_pass` drops, so `complete` never sees a slot that
+         // is in no list.
+@@ -367,6 +371,17 @@ pub fn slotUncachedTail(slot: *Slot) usize {
+     const total = slot.full_prompt.len;
+     if (slot.skip_prefix_cache or slot.cache_variant != 0 or slot.media.len > 0) return total;
+     const hc = if (slot.prefix_cache) |p| p else return total;
++    if (slot.model.transformer) |xf| {
++        if (@import("plugin/intree.zig").dsv41(xf) != null) {
++            if (slot.module_tail_hint) |hint| {
++                if (hint.counter == hc.counter and hint.entries == hc.entryCount()) return hint.tail;
++            }
++            const binding = prefix_cache_mod.ModuleBinding.init(xf) orelse return total;
++            const tail = total - @min(total, hc.peekModuleTextTokens(binding, slot.full_prompt, slot.has_tools, slot.cache.config));
++            slot.module_tail_hint = .{ .counter = hc.counter, .entries = hc.entryCount(), .tail = tail };
++            return tail;
++        }
++    }
+     return total - @min(total, hc.peekMatchedTokens(slot.full_prompt, slot.has_tools, slot.cache.config, slot.ssm_entries != null));
+ }
+ 
+@@ -797,6 +812,7 @@ const BoundaryFixture = struct {
+         s.skip_prefix_cache = false;
+         s.cache_variant = 0;
+         s.boundary_max_tail = null;
++        s.module_tail_hint = null;
+         s.prompt_logprobs = false;
+         s.enable_mtp = false;
+         s.legacy_gen = null;
+diff --git a/src/engines/mlx/slot.zig b/src/engines/mlx/slot.zig
+index 0487dd2..6359aff 100644
+--- a/src/engines/mlx/slot.zig
++++ b/src/engines/mlx/slot.zig
+@@ -82,6 +82,8 @@ pub const Slot = struct {
+     /// Set while the slot is prefilled at another prefill's chunk boundary: the most uncached tokens it
+     /// may forward there. A restore that covers less than the pre-filter peeked hands the request back.
+     boundary_max_tail: ?usize = null,
++    // The queued prompt is immutable. Rescan only after cache activity or eviction.
++    module_tail_hint: ?struct { counter: u64, entries: usize, tail: usize } = null,
+     /// `X-MLX-Priority: high`: may be prefilled at another prefill's chunk boundary up to `PRIORITY_MAX_TAIL`.
+     priority: bool = false,
+     /// Qwen3-VL M-RoPE position-id table (flat [3 × mrope_total]) + decode delta.

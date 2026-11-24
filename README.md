@@ -50,3 +50,7 @@ The 131.76 MiB download stores aggregate row IDs and frequencies from 31,119,433
 The builder ranks rows by frequency across the two layers, reserving at least one row per layer. At 48 GiB, all 174,974,556 observed rows fit. The builder distributes the remaining slots across the buckets in proportion to their unused capacity. Each packed row uses 256 bytes of native codes and eight bytes of scales. Model weights stay on the machine that builds the pack.
 
 The patch includes portions of mlx-serve under its [MIT license](patches/LICENSE.mlx-serve).
+
+## Prefix caching and concurrent requests
+
+An optional companion patch helps DeepSeek V4.1 reuse conversation checkpoints across branches and admit a short cached follow-up while a long prompt is prefilling. It also adds diagnostics for cold requests that could have reused an evicted checkpoint. See [how the prefix-cache changes work, how to test them, and how to revert](PREFIX-CACHE.md).
